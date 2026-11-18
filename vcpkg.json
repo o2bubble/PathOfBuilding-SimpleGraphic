@@ -6,6 +6,7 @@
     "cmakerc",
     "curl",
     "fmt",
+    "freetype",
     "glfw3",
     "gli",
     "glm",

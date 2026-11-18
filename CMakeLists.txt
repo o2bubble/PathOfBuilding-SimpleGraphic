@@ -23,6 +23,7 @@ find_package(unofficial-angle CONFIG REQUIRED)
 find_package(CMakeRC CONFIG REQUIRED)
 find_package(CURL CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
+find_package(Freetype REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(gli CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
@@ -243,6 +244,7 @@ target_link_libraries(SimpleGraphic
     unofficial::angle::libGLESv2
     cmp_core
     fmt::fmt
+    Freetype::Freetype
     glfw
     gli
     glm::glm

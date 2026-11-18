@@ -9,6 +9,7 @@
 // =======
 
 #include <string_view>
+#include <memory>
 
 // Font
 class r_font_c {
@@ -44,4 +45,11 @@ private:
 	struct f_fontHeight_s *fontHeights[32] = {};
 	int		maxHeight = 0;
 	int*	fontHeightMap = nullptr;
+
+	// FreeType CJK fallback (r_font.cpp). Loads a TrueType face and rasterizes
+	// codepoints the .tga bitmap font cannot address, which is every CJK
+	// character: f_fontHeight_s::glyphs holds 128 entries indexed by a single
+	// byte, so anything above U+007F used to draw as a [U+XXXX] placeholder.
+	struct FtCache;
+	std::unique_ptr<FtCache> ftCache;
 };

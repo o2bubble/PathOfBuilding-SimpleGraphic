@@ -11,6 +11,18 @@
 #include <fstream>
 #include <string>
 #include <cmath>
+#include <cstdlib>
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include FT_SYNTHESIS_H
+#include FT_TRUETYPE_TABLES_H
+
+#include "r_font_fallback.h"
 
 // =======
 // Classes
@@ -40,6 +52,215 @@ struct f_fontHeight_s {
 			return defGlyph;
 		}
 		return glyphs[(unsigned char)ch];
+	}
+};
+
+// =====================
+// FreeType CJK Fallback
+// =====================
+
+static const int FT_ATLAS_SIZE = 2048;
+
+// Glyphs are rasterized at the FINAL drawn pixel height, not at the bitmap
+// bucket height and then rescaled: rescaling a grayscale bitmap under
+// GL_LINEAR is what smears CJK text. Draw and measure must map a text height
+// through the same helper or advances drift apart.
+static inline int FtPixelSize(int height) {
+	return height > 0 ? height : 1;
+}
+
+struct FtCachedGlyph {
+	int atlasIndex = -1;
+	float tcLeft = 0.0f, tcRight = 0.0f, tcTop = 0.0f, tcBottom = 0.0f;
+	int bitmapWidth = 0;
+	int bitmapRows = 0;
+	int bearingX = 0;
+	int bearingY = 0;
+	int advance = 0; // pixels
+};
+
+struct FtAtlas {
+	r_tex_c* tex = nullptr;
+	int curX = 1; // 1px padding from the edge, so GL_LINEAR never samples a neighbour
+	int curY = 1;
+	int rowHeight = 0;
+};
+
+struct r_font_c::FtCache {
+	FT_Library library = nullptr;
+	FT_Face face = nullptr;
+	r_renderer_c* renderer = nullptr;
+	std::vector<FtAtlas> atlases;
+	// Key: (pixelSize << 21) | codepoint — heights up to 2048, codepoints to 2M.
+	std::unordered_map<uint64_t, FtCachedGlyph> cache;
+	// Codepoints the face has no glyph for, so no atlas slot is burned twice.
+	std::unordered_set<char32_t> missing;
+	// Other shipped faces, tried in order when the primary lacks a codepoint.
+	FtFallbackChain fallback;
+	// Baseline as a fraction of the line cell, from the PRIMARY face's metrics.
+	float baselineRatio = 0.82f;
+
+	bool Init(r_renderer_c* rend, const std::string& ttfPath) {
+		renderer = rend;
+		if (FT_Init_FreeType(&library)) {
+			rend->sys->con->Warning("FreeType: failed to initialize library");
+			return false;
+		}
+		if (FT_New_Face(library, ttfPath.c_str(), 0, &face)) {
+			rend->sys->con->Warning("FreeType: failed to load font '%s'", ttfPath.c_str());
+			FT_Done_FreeType(library);
+			library = nullptr;
+			return false;
+		}
+		rend->sys->con->Printf("FreeType: loaded CJK fallback font '%s'", ttfPath.c_str());
+
+		// Baseline from the face's real metrics rather than the 0.82 guess.
+		// OS/2 typo ascender/descender puts the ideographic em box flush with
+		// the line cell for CJK faces; hhea is the fallback.
+		long asc = 0, desc = 0;
+		if (auto* os2 = (TT_OS2*)FT_Get_Sfnt_Table(face, FT_SFNT_OS2)) {
+			if (os2->sTypoAscender > 0 && os2->sTypoAscender > os2->sTypoDescender) {
+				asc = os2->sTypoAscender;
+				desc = os2->sTypoDescender;
+			}
+		}
+		if (!asc && face->ascender > 0 && face->ascender > face->descender) {
+			asc = face->ascender;
+			desc = face->descender;
+		}
+		if (asc) {
+			float ratio = (float)asc / (float)(asc - desc);
+			if (ratio >= 0.5f && ratio <= 1.0f) baselineRatio = ratio;
+		}
+		return true;
+	}
+
+	~FtCache() {
+		for (auto& atlas : atlases) delete atlas.tex;
+		fallback.Close();
+		if (face) FT_Done_Face(face);
+		if (library) FT_Done_FreeType(library);
+	}
+
+	FT_Face FaceFor(char32_t cp) {
+		return fallback.FaceFor(library, face, cp, [this, cp](const std::string& path, bool ok) {
+			if (ok) {
+				renderer->sys->con->Printf(
+					"FreeType: opened fallback font '%s' (U+%04X missing from the primary face)",
+					path.c_str(), (unsigned)cp);
+			} else {
+				renderer->sys->con->Warning("FreeType: failed to open fallback font '%s'", path.c_str());
+			}
+		});
+	}
+
+	FtAtlas& EnsureAtlas(int glyphW, int glyphH) {
+		if (!atlases.empty()) {
+			auto& last = atlases.back();
+			if (last.curX + glyphW + 1 <= FT_ATLAS_SIZE &&
+			    last.curY + (std::max)(last.rowHeight, glyphH) + 1 <= FT_ATLAS_SIZE) {
+				return last;
+			}
+			if (last.curY + last.rowHeight + glyphH + 2 <= FT_ATLAS_SIZE) {
+				last.curX = 1;
+				last.curY += last.rowHeight + 1;
+				last.rowHeight = 0;
+				return last;
+			}
+		}
+
+		FtAtlas atlas;
+		auto img = std::make_unique<image_c>();
+		std::vector<byte> zeros(FT_ATLAS_SIZE * FT_ATLAS_SIZE * 4, 0);
+		img->CopyRaw(IMGTYPE_RGBA, FT_ATLAS_SIZE, FT_ATLAS_SIZE, zeros.data());
+		atlas.tex = new r_tex_c(renderer->texMan, std::move(img), TF_NOMIPMAP | TF_CLAMP);
+		atlas.tex->fileWidth = FT_ATLAS_SIZE;
+		atlas.tex->fileHeight = FT_ATLAS_SIZE;
+		atlases.push_back(atlas);
+
+		renderer->sys->con->Printf("FreeType: created atlas #%d (%dx%d)",
+			(int)atlases.size(), FT_ATLAS_SIZE, FT_ATLAS_SIZE);
+		return atlases.back();
+	}
+
+	// Returns null when the face (and every fallback) has no glyph for cp, so
+	// the caller can draw the [U+XXXX] placeholder instead of an empty box.
+	FtCachedGlyph* GetGlyph(char32_t cp, int pixelSize) {
+		if (!face) return nullptr;
+
+		uint64_t key = ((uint64_t)pixelSize << 21) | (uint32_t)cp;
+		auto it = cache.find(key);
+		if (it != cache.end()) return &it->second;
+		if (missing.count(cp)) return nullptr;
+
+		FT_Face useFace = FaceFor(cp);
+		if (FT_Get_Char_Index(useFace, (FT_ULong)cp) == 0) {
+			missing.insert(cp);
+			return nullptr;
+		}
+
+		FT_Set_Pixel_Sizes(useFace, 0, pixelSize);
+		if (FT_Load_Char(useFace, (FT_ULong)cp, FT_LOAD_RENDER)) return nullptr;
+
+		FT_GlyphSlot slot = useFace->glyph;
+		FT_Bitmap& bmp = slot->bitmap;
+		int glyphW = (int)bmp.width;
+		int glyphH = (int)bmp.rows;
+
+		// Zero-size glyphs (spaces in CJK) still advance the pen.
+		if (glyphW == 0 || glyphH == 0) {
+			FtCachedGlyph glyph{};
+			glyph.bearingX = slot->bitmap_left;
+			glyph.bearingY = slot->bitmap_top;
+			glyph.advance = (int)(slot->advance.x >> 6);
+			auto [inserted, _] = cache.emplace(key, glyph);
+			return &inserted->second;
+		}
+
+		FtAtlas& atlas = EnsureAtlas(glyphW, glyphH);
+		int atlasIdx = (int)(atlases.size() - 1);
+		int x = atlas.curX;
+		int y = atlas.curY;
+
+		std::vector<byte> pixels(glyphW * glyphH * 4);
+		for (int row = 0; row < glyphH; row++) {
+			for (int col = 0; col < glyphW; col++) {
+				int srcIdx = row * bmp.pitch + col;
+				int dstIdx = (row * glyphW + col) * 4;
+				byte gray = bmp.num_grays > 1 ? bmp.buffer[srcIdx] : 255;
+				pixels[dstIdx + 0] = 255;
+				pixels[dstIdx + 1] = 255;
+				pixels[dstIdx + 2] = 255;
+				pixels[dstIdx + 3] = gray; // coverage in alpha; the quad tints it
+			}
+		}
+
+		glBindTexture(atlas.tex->target, atlas.tex->texId);
+		glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+		if (atlas.tex->target == GL_TEXTURE_2D_ARRAY) {
+			glTexSubImage3D(atlas.tex->target, 0, x, y, 0,
+				glyphW, glyphH, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+		} else {
+			glTexSubImage2D(atlas.tex->target, 0, x, y,
+				glyphW, glyphH, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+		}
+
+		FtCachedGlyph glyph{};
+		glyph.atlasIndex = atlasIdx;
+		glyph.tcLeft = (float)x / FT_ATLAS_SIZE;
+		glyph.tcRight = (float)(x + glyphW) / FT_ATLAS_SIZE;
+		glyph.tcTop = (float)y / FT_ATLAS_SIZE;
+		glyph.tcBottom = (float)(y + glyphH) / FT_ATLAS_SIZE;
+		glyph.bitmapWidth = glyphW;
+		glyph.bitmapRows = glyphH;
+		glyph.bearingX = slot->bitmap_left;
+		glyph.bearingY = slot->bitmap_top;
+		glyph.advance = (int)(slot->advance.x >> 6); // FT advances are 26.6 fixed point
+
+		auto [inserted, _] = cache.emplace(key, glyph);
+		atlas.curX += glyphW + 1;
+		atlas.rowHeight = (std::max)(atlas.rowHeight, glyphH);
+		return &inserted->second;
 	}
 };
 
@@ -112,6 +333,59 @@ r_font_c::r_font_c(r_renderer_c* renderer, const char* fontName)
 			}
 		}
 	}
+
+	// Try to initialize the FreeType CJK fallback. Search order:
+	//   1. POB_ZH_FONTDIR/Fonts/<POB_ZH_FONTFILE>  (explicit user choice)
+	//   2. POB_ZH_FONTDIR/Fonts/NotoSansTC-Regular.ttf, then FZ_ZY.ttf
+	//   3. SimpleGraphic/Fonts/<same names>        (CWD = the POB folder)
+	std::vector<std::string> ttfCandidates;
+	auto addCandidate = [&](const std::string& dir, const std::string& file) {
+		if (!dir.empty() && file.size()) {
+			std::string p = dir;
+			if (p.back() != '/' && p.back() != '\\') p += '/';
+			ttfCandidates.push_back(p + file);
+		}
+	};
+	// 1. Explicit override: POB_ZH_FONTDIR points at a folder holding Fonts/.
+	if (const char* dir = getenv("POB_ZH_FONTDIR")) {
+		if (const char* ff = getenv("POB_ZH_FONTFILE")) {
+			if (ff[0]) addCandidate(std::string(dir) + "/Fonts", ff);
+		}
+		addCandidate(std::string(dir) + "/Fonts", "NotoSansTC-Regular.ttf");
+		addCandidate(std::string(dir) + "/Fonts", "FZ_ZY.ttf");
+	}
+	// 2. Next to the shipped bitmap fonts, resolved from the exe directory —
+	//    the CWD is the script folder by the time fonts load, so a relative
+	//    CFG_DATAPATH alone would never find them.
+	const std::string exeDir = renderer->sys->basePath.string();
+	addCandidate(exeDir + "/" + CFG_DATAPATH "Fonts", "NotoSansTC-Regular.ttf");
+	addCandidate(exeDir + "/" + CFG_DATAPATH "Fonts", "FZ_ZY.ttf");
+	addCandidate(exeDir + "/" + CFG_DATAPATH "Fonts", "CJKFallback.ttf");
+	// 3. runtime/Fonts/ and CWD-relative fallbacks.
+	addCandidate(exeDir + "/Fonts", "NotoSansTC-Regular.ttf");
+	addCandidate(exeDir + "/Fonts", "FZ_ZY.ttf");
+	addCandidate("Fonts", "NotoSansTC-Regular.ttf");
+	addCandidate("Fonts", "FZ_ZY.ttf");
+	addCandidate(CFG_DATAPATH "Fonts", "NotoSansTC-Regular.ttf");
+	addCandidate(CFG_DATAPATH "Fonts", "FZ_ZY.ttf");
+
+	for (size_t i = 0; i < ttfCandidates.size(); i++) {
+		std::ifstream probe(ttfCandidates[i]);
+		if (!probe.good()) continue;
+		probe.close();
+		auto cache = std::make_unique<FtCache>();
+		if (cache->Init(renderer, ttfCandidates[i])) {
+			// Every other candidate that exists becomes a fallback, in the
+			// same priority order: Noto Sans TC is a subset build and lacks
+			// characters the game's own text uses.
+			cache->fallback.CollectFallbacks(ttfCandidates, i, [](const std::string& path) {
+				std::ifstream p(path);
+				return p.good();
+			});
+			ftCache = std::move(cache);
+			break;
+		}
+	}
 }
 
 r_font_c::~r_font_c()
@@ -158,6 +432,16 @@ int r_font_c::StringWidthInternal(f_fontHeight_s* fh, std::u32string_view str, i
 			idx += escLen;
 		}
 		else if (ch >= (unsigned)fh->numGlyph) {
+			// CJK: measure with the same FreeType advance the draw path uses,
+			// or the caret and the selection background drift off the glyphs.
+			if (ftCache) {
+				if (auto* ftGlyph = ftCache->GetGlyph(ch, FtPixelSize(height))) {
+					width += ftGlyph->advance;
+					width = std::ceil(width);
+					++idx;
+					continue;
+				}
+			}
 			auto tofu = BuildTofuString(ch);
 			for (auto cp : tofu) {
 				width += measureCodepoint(tofuFont.fh, cp);
@@ -222,6 +506,19 @@ size_t r_font_c::StringCursorInternal(f_fontHeight_s* fh, std::u32string_view st
 			I += escLen;
 		}
 		else if (*I >= (unsigned)fh->numGlyph) {
+			// CJK: one codepoint is one caret stop, using the FreeType advance
+			// that StringWidthInternal measures with.
+			if (ftCache) {
+				if (auto* ftGlyph = ftCache->GetGlyph(*I, FtPixelSize(height))) {
+					x += ftGlyph->advance;
+					x = std::ceil(x);
+					if (curX <= x) {
+						return std::distance(str.begin(), I);
+					}
+					++I;
+					continue;
+				}
+			}
 			auto tofu = BuildTofuString(*I);
 			for (auto cp : tofu) {
 				x += measureCodepoint(tofuFont.fh, cp);
@@ -394,11 +691,53 @@ void r_font_c::DrawTextLine(scp_t pos, int align, int height, col4_t col, std::u
 		x = std::ceil(x);
 	};
 
+	// FreeType path. The glyph is rasterized at the final pixel height, and x,
+	// bearings and bitmap sizes are integral, so the quad samples the atlas
+	// texel-exact under GL_LINEAR — that is what keeps CJK text sharp.
+	const int ftPx = FtPixelSize(height);
+	const int ftBaselinePx = ftCache ? (int)std::lround(height * ftCache->baselineRatio) : 0;
+
+	auto drawFtGlyph = [this, &curTex, &x, y, ftBaselinePx](FtCachedGlyph* ftg) {
+		if (ftg->atlasIndex < 0 || ftg->bitmapWidth == 0) {
+			x += ftg->advance; // space-like glyph: advance only
+			x = std::ceil(x);
+			return;
+		}
+		auto* atlasTex = ftCache->atlases[ftg->atlasIndex].tex;
+		if (curTex != atlasTex) {
+			curTex = atlasTex;
+			renderer->curLayer->Bind(atlasTex);
+		}
+		float glyphX = std::round(x) + ftg->bearingX;
+		float glyphY = y + ftBaselinePx - ftg->bearingY;
+		float glyphW = (float)ftg->bitmapWidth;
+		float glyphH = (float)ftg->bitmapRows;
+		if (glyphX + glyphW >= 0 && glyphX < renderer->VirtualScreenWidth()) {
+			renderer->curLayer->Quad(
+				ftg->tcLeft, ftg->tcTop, glyphX, glyphY,
+				ftg->tcRight, ftg->tcTop, glyphX + glyphW, glyphY,
+				ftg->tcRight, ftg->tcBottom, glyphX + glyphW, glyphY + glyphH,
+				ftg->tcLeft, ftg->tcBottom, glyphX, glyphY + glyphH
+			);
+		}
+		x += ftg->advance;
+		x = std::ceil(x);
+	};
+
 	// Render the string
 	for (auto tail = str; !tail.empty();) {
 		// Draw unprintable characters as tofu placeholders
 		auto ch = tail[0];
 		if (ch >= (unsigned)fh->numGlyph) {
+			// CJK through FreeType; the [U+XXXX] placeholder is what is left
+			// when no shipped face has the glyph either.
+			if (ftCache) {
+				if (auto* ftGlyph = ftCache->GetGlyph(ch, ftPx)) {
+					drawFtGlyph(ftGlyph);
+					tail = tail.substr(1);
+					continue;
+				}
+			}
 			auto tofu = BuildTofuString(ch);
 			for (auto ch : tofu) {
 				drawCodepoint(tofuFont.fh, tofuFont.fh->height, 1.0f, tofuFont.yPad, ch);

@@ -552,7 +552,34 @@ void ui_main_c::CallKeyHandler(const char* hname, int key, bool dblclk)
 	if (extraArgs < 0) {
 		return;
 	}
-	if (key < 128) {
+	// OnChar carries a Unicode codepoint from GLFW's char callback, which is
+	// where IME composition lands. Only KEYDOWN/KEYUP carry the engine's
+	// internal key codes, so the two must not share one conversion: encoding a
+	// composed codepoint through NameForKey() turned every non-ASCII character
+	// -- i.e. every CJK character -- into "?".
+	if (_stricmp(hname, "OnChar") == 0) {
+		char utf8[4];
+		int len = 1;
+		if (key < 0x80) {
+			utf8[0] = (char)key;
+		} else if (key < 0x800) {
+			utf8[0] = (char)(0xC0 | (key >> 6));
+			utf8[1] = (char)(0x80 | (key & 0x3F));
+			len = 2;
+		} else if (key < 0x10000) {
+			utf8[0] = (char)(0xE0 | (key >> 12));
+			utf8[1] = (char)(0x80 | ((key >> 6) & 0x3F));
+			utf8[2] = (char)(0x80 | (key & 0x3F));
+			len = 3;
+		} else {
+			utf8[0] = (char)(0xF0 | (key >> 18));
+			utf8[1] = (char)(0x80 | ((key >> 12) & 0x3F));
+			utf8[2] = (char)(0x80 | ((key >> 6) & 0x3F));
+			utf8[3] = (char)(0x80 | (key & 0x3F));
+			len = 4;
+		}
+		lua_pushlstring(L, utf8, len);
+	} else if (key < 128) {
 		lua_pushfstring(L, "%c", key);
 	} else {
 		lua_pushstring(L, NameForKey(key));
